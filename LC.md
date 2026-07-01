@@ -560,4 +560,161 @@ final class CreateTicketFormComponent
 - **Tests** : le `TicketGatewayInterface` te permet de tester tous les handlers avec un mock, sans jamais toucher au HTTP.
 - **`accountId` pour l'assignation** : il te faudra une query `GetAssignableUsersQuery` similaire à celle des statuts si tu veux peupler un select d'utilisateurs.
 
-Souhaites-tu que je détaille la gestion d'erreurs Jira ou le mapping des utilisateurs assignables ?
+Voici l'extension pour ajouter un filtre texte (titre/description), avec debounce côté Live Component pour éviter de spammer Jira à chaque frappe.
+
+## 1. Adapter la Query pour accepter un terme de recherche
+
+```php
+// src/Ticket/Application/Query/ListTickets/ListTicketsQuery.php
+namespace App\Ticket\Application\Query\ListTickets;
+
+final class ListTicketsQuery
+{
+    public function __construct(
+        public readonly ?string $searchTerm = null,
+        public readonly int $maxResults = 25,
+    ) {}
+}
+```
+
+On ne construit plus le JQL côté UI (le composant ne doit pas connaître la syntaxe JQL) — c'est le handler/gateway qui s'en charge, ce qui garde le Live Component ignorant de Jira comme évoqué plus tôt.
+
+```php
+// src/Ticket/Application/Query/ListTickets/ListTicketsHandler.php
+namespace App\Ticket\Application\Query\ListTickets;
+
+use App\Ticket\Domain\Port\TicketGatewayInterface;
+use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+
+#[AsMessageHandler(bus: 'query.bus')]
+final class ListTicketsHandler
+{
+    public function __construct(
+        private readonly TicketGatewayInterface $gateway,
+    ) {}
+
+    public function __invoke(ListTicketsQuery $query): array
+    {
+        $jql = $this->buildJql($query->searchTerm);
+
+        return $this->gateway->search($jql, $query->maxResults);
+    }
+
+    private function buildJql(?string $searchTerm): string
+    {
+        if (empty($searchTerm)) {
+            return 'ORDER BY updated DESC';
+        }
+
+        // échappement basique des guillemets pour éviter une injection JQL
+        $escaped = str_replace('"', '\\"', $searchTerm);
+
+        return sprintf(
+            'summary ~ "%s" OR description ~ "%s" ORDER BY updated DESC',
+            $escaped,
+            $escaped
+        );
+    }
+}
+```
+
+L'opérateur `~` en JQL fait une recherche "contains" (full-text) sur le champ.
+
+## 2. Le Live Component avec le filtre
+
+```php
+// src/Ticket/UI/Component/TicketListComponent.php
+namespace App\Ticket\UI\Component;
+
+use App\Ticket\Application\Query\ListTickets\ListTicketsQuery;
+use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
+use Symfony\UX\LiveComponent\Attribute\AsLiveComponent;
+use Symfony\UX\LiveComponent\Attribute\LiveProp;
+use Symfony\UX\LiveComponent\DefaultActionTrait;
+
+#[AsLiveComponent]
+final class TicketListComponent
+{
+    use DefaultActionTrait;
+
+    #[LiveProp(writable: true)]
+    public ?string $searchTerm = null;
+
+    public function __construct(
+        private readonly MessageBusInterface $queryBus,
+    ) {}
+
+    public function getTickets(): array
+    {
+        $envelope = $this->queryBus->dispatch(new ListTicketsQuery($this->searchTerm));
+
+        return $envelope->last(HandledStamp::class)->getResult();
+    }
+}
+```
+
+Le point important : pas de méthode custom pour la recherche. `$searchTerm` est un `LiveProp(writable: true)` — dès qu'il change côté front, le composant se re-render automatiquement et rappelle `getTickets()` avec la nouvelle valeur. C'est le mécanisme `data-model` que tu voulais que je détaille.
+
+## 3. Le template avec debounce
+
+```twig
+{# templates/components/TicketListComponent.html.twig #}
+<div{{ attributes }}>
+    <input
+        type="search"
+        placeholder="Rechercher par titre ou description..."
+        data-model="debounce(400)|searchTerm"
+        value="{{ this.searchTerm }}"
+    >
+
+    <div data-loading="addClass(opacity-50)">
+        <table class="table">
+            <thead>
+                <tr><th>Clé</th><th>Résumé</th><th>Statut</th><th>Assigné</th></tr>
+            </thead>
+            <tbody>
+                {% for ticket in this.tickets %}
+                    <tr>
+                        <td>{{ ticket.key }}</td>
+                        <td>{{ ticket.summary }}</td>
+                        <td>{{ ticket.status }}</td>
+                        <td>{{ ticket.assignee ?? '—' }}</td>
+                    </tr>
+                {% else %}
+                    <tr><td colspan="4">Aucun ticket trouvé.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+```
+
+## Explication du `data-model`
+
+```
+data-model="debounce(400)|searchTerm"
+```
+
+- `searchTerm` : lie l'input à la propriété PHP `$searchTerm` — chaque frappe met à jour la valeur.
+- `debounce(400)` : attend 400ms sans frappe avant d'envoyer la requête AJAX au serveur. Sans ça, chaque caractère tapé déclencherait un appel réseau vers Jira (très mauvais niveau perf/rate-limit).
+- `data-loading="addClass(opacity-50)"` : ajoute une classe CSS pendant que la requête est en cours (feedback visuel simple, sans JS custom).
+
+## Flux complet
+
+```
+[Utilisateur tape "bug login"]
+   → debounce 400ms (JS géré par le bundle, rien à écrire)
+   → POST /_components/TicketListComponent (avec searchTerm=bug login)
+   → réhydratation + re-render → getTickets() appelé
+   → dispatch ListTicketsQuery('bug login')
+   → ListTicketsHandler construit le JQL et interroge Jira
+   → réponse HTML re-render
+   → morphing DOM (seul le tbody change)
+```
+
+## Point d'attention
+
+Pas de cache sur cette query (contrairement aux statuts) : le contenu change à chaque frappe donc le cache n'apporterait rien, sauf si plusieurs utilisateurs tapent souvent les mêmes termes — dans ce cas un cache TTL très court (10-30s) sur le résultat de recherche pourrait avoir du sens si Jira devient un goulot d'étranglement en pratique.
+
+Veux-tu que j'ajoute la pagination (LiveProp `page` + `maxResults`) pour compléter cet exemple ?
